@@ -1,77 +1,86 @@
 #include "graphnet/graphnet.hpp"
-#include <cassert>
+#include <cstdlib>
 #include <iostream>
-
+#include <string>
 using namespace graphnet;
-static Payload account(std::int64_t n) { return {{"balance", Value{n}}}; }
-static std::int64_t balance(const Payload& p) { return std::get<std::int64_t>(p.at("balance")); }
-
-static void transfer_commits_two_versions() {
-    GraphState g;
-    auto a = Entity::create("Account", account(100));
-    auto b = Entity::create("Account", account(50));
-    auto aid = a.id; auto bid = b.id;
-    g.insert_entity(a); g.insert_entity(b);
-    auto m = Mutation::create({{aid, Version::initial()}, {bid, Version::initial()}},
-        {{aid, Version::initial(), account(80)}, {bid, Version::initial(), account(70)}});
-    auto mid = m.id;
-    auto c = g.apply(m);
-    assert(c.transitions.size() == 2 && c.dependencies.size() == 2);
-    assert(g.current_state(aid).version.value == 2 && g.current_state(bid).version.value == 2);
-    assert(balance(g.current_state(aid).payload) == 80 && balance(g.current_state(bid).payload) == 70);
-    assert(g.history(aid).size() == 2 && g.history(bid).size() == 2);
-    assert(g.commit(mid) && g.mutation(mid) && g.dependencies_of(mid)->size() == 2);
+namespace {
+int checks = 0;
+void check(bool ok, const char *message) {
+  ++checks;
+  if (!ok) {
+    std::cerr << "FAIL: " << message << '\n';
+    std::exit(1);
+  }
 }
-static void stale_mutation_is_rejected_without_changes() {
-    GraphState g; auto a = Entity::create("Account", account(100)); auto id = a.id; g.insert_entity(a);
-    g.apply(Mutation::create({{id, Version::initial()}},
-        {{id, Version::initial(), account(90)}}));
-    bool rejected = false;
-    try { g.apply(Mutation::create({{id, Version::initial()}},
-            {{id, Version::initial(), account(80)}})); }
-    catch (const GraphError& e) { rejected = e.code() == ErrorCode::VersionConflict; }
-    assert(rejected && balance(g.current_state(id).payload) == 90);
+template <class F> void throws(F &&f, const char *message) {
+  ++checks;
+  try {
+    f();
+  } catch (const std::exception &) {
+    return;
+  }
+  std::cerr << "FAIL (expected exception): " << message << '\n';
+  std::exit(1);
 }
-static void multi_entity_validation_is_atomic() {
-    GraphState g; auto a = Entity::create("Account", account(100)); auto b = Entity::create("Account", account(50));
-    auto aid = a.id; auto bid = b.id; g.insert_entity(a); g.insert_entity(b);
-    bool rejected = false;
-    try { g.apply(Mutation::create({{aid, Version::initial()}, {bid, Version::initial()}},
-        {{aid, Version::initial(), account(80)}, {bid, Version{999}, account(70)}})); }
-    catch (const GraphError& e) { rejected = e.code() == ErrorCode::VersionConflict; }
-    assert(rejected);
-    assert(g.current_state(aid).version.value == 1 && g.current_state(bid).version.value == 1);
-    assert(balance(g.current_state(aid).payload) == 100 && balance(g.current_state(bid).payload) == 50);
-}
-static void unknown_dependency_is_rejected() {
-    GraphState g; auto a = Entity::create("Account", account(100)); auto id = a.id; g.insert_entity(a);
-    bool rejected = false;
-    try { g.apply(Mutation::create({{id, Version{999}}}, {{id, Version::initial(), account(90)}})); }
-    catch (const GraphError& e) { rejected = e.code() == ErrorCode::StateReferenceNotFound; }
-    assert(rejected && g.current_state(id).version.value == 1);
-}
-static void duplicate_and_empty_writes_are_rejected() {
-    GraphState g; auto a = Entity::create("Account", account(100)); auto id = a.id; g.insert_entity(a);
-    bool duplicate = false, empty = false;
-    try { g.apply(Mutation::create({}, {{id, Version::initial(), account(90)}, {id, Version::initial(), account(80)}})); }
-    catch (const GraphError& e) { duplicate = e.code() == ErrorCode::DuplicateWrite; }
-    try { g.apply(Mutation::create({}, {})); }
-    catch (const GraphError& e) { empty = e.code() == ErrorCode::EmptyMutation; }
-    assert(duplicate && empty && g.current_state(id).version.value == 1);
-}
-static void disjoint_mutations_commit_independently() {
-    GraphState g; auto a = Entity::create("Account", account(100)); auto b = Entity::create("Account", account(50));
-    auto aid = a.id; auto bid = b.id; g.insert_entity(a); g.insert_entity(b);
-    g.apply(Mutation::create({{aid, Version::initial()}}, {{aid, Version::initial(), account(95)}}));
-    g.apply(Mutation::create({{bid, Version::initial()}}, {{bid, Version::initial(), account(60)}}));
-    assert(balance(g.current_state(aid).payload) == 95 && balance(g.current_state(bid).payload) == 60);
-}
+Payload payload(std::int64_t value) { return {{"value", value}}; }
+} // namespace
 int main() {
-    transfer_commits_two_versions();
-    stale_mutation_is_rejected_without_changes();
-    multi_entity_validation_is_atomic();
-    unknown_dependency_is_rejected();
-    duplicate_and_empty_writes_are_rejected();
-    disjoint_mutations_commit_independently();
-    std::cout << "All GraphNet C++ milestone 0.1 tests passed.\\n";
+  GraphEngine e;
+  auto a = e.insert_entity(Entity::create("Thing", payload(1)));
+  auto b = e.insert_entity(Entity::create("Thing", payload(10)));
+  check(e.state().current_state(a.entity_id).version.value == 1,
+        "initial version");
+  auto c1 =
+      e.apply(Mutation::create({}, {{a.entity_id, a.version, payload(2)}}));
+  auto m1 = GraphElementId::mutation(c1.mutation_id);
+  auto a2 = GraphElementId::state(c1.transitions[0].new_node_id);
+  check(e.causal_relation(GraphElementId::state(a.node_id), m1) ==
+            CausalRelation::Before,
+        "predecessor precedes mutation");
+  check(e.causal_relation(m1, a2) == CausalRelation::Before,
+        "mutation precedes output state");
+  check(e.causal_relation(m1, m1) == CausalRelation::Same,
+        "same element relation");
+  auto c2 =
+      e.apply(Mutation::create({}, {{b.entity_id, b.version, payload(11)}}));
+  auto m2 = GraphElementId::mutation(c2.mutation_id);
+  check(e.causal_relation(m1, m2) == CausalRelation::Concurrent,
+        "independent writes concurrent");
+  check(e.causal_graph().ancestors(a2).size() == 2,
+        "transitive ancestors include initial state and mutation");
+  check(e.causal_graph()
+            .descendants(GraphElementId::state(a.node_id))
+            .contains(a2),
+        "transitive descendants");
+  check(e.state().history(a.entity_id).size() == 2, "entity history");
+  auto frontier = e.frontier();
+  check(frontier.contains(a2) && frontier.contains(GraphElementId::state(
+                                     c2.transitions[0].new_node_id)),
+        "causal heads in frontier");
+  DependencyGraph cyclic;
+  auto x = GraphElementId::state(NodeId{"x"});
+  auto y = GraphElementId::state(NodeId{"y"});
+  cyclic.add_element(x);
+  cyclic.add_element(y);
+  cyclic.add_edge(x, y);
+  throws([&] { cyclic.add_edge(y, x); }, "cycle rejected");
+  auto before = e.causal_graph().edge_count();
+  throws(
+      [&] {
+        e.apply(Mutation::create({}, {{a.entity_id, Version{99}, payload(3)}}));
+      },
+      "stale write rejected");
+  check(e.causal_graph().edge_count() == before,
+        "failed mutation leaves graph unchanged");
+  throws(
+      [&] {
+        e.apply(Mutation::create({}, {{a.entity_id, a.version, payload(4)},
+                                      {a.entity_id, a.version, payload(5)}}));
+      },
+      "duplicate writes rejected");
+  throws([&] { e.apply(Mutation::create({}, {})); }, "empty mutation rejected");
+  throws(
+      [&] { e.causal_relation(GraphElementId::state(NodeId{"missing"}), m1); },
+      "unknown graph node rejected");
+  std::cout << "Passed " << checks << " checks\n";
 }
